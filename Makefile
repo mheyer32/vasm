@@ -1,6 +1,6 @@
 # Unix, using gcc
 
-CC = gcc
+CC = cc
 TARGET =
 TARGETEXTENSION =
 
