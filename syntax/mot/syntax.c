@@ -1,5 +1,5 @@
 /* syntax.c  syntax module for vasm */
-/* (c) in 2002-2021 by Frank Wille */
+/* (c) in 2002-2022 by Frank Wille */
 
 #include "vasm.h"
 
@@ -12,7 +12,7 @@
    be provided by the main module.
 */
 
-char *syntax_copyright="vasm motorola syntax module 3.15a (c) 2002-2021 Frank Wille";
+char *syntax_copyright="vasm motorola syntax module 3.15d (c) 2002-2022 Frank Wille";
 hashtable *dirhash;
 char commentchar = ';';
 int dotdirs;
@@ -321,6 +321,13 @@ static void handle_uspace(char *s,int size)
 {
   atom *a = do_space(size,parse_expr_tmplab(&s),0);
   a->content.sb->flags |= SPC_UNINITIALIZED;
+}
+
+
+static void handle_dbss(char *s,int size)
+{
+  atom *a = do_space(size,parse_expr_tmplab(&s),0);
+  a->content.sb->flags |= SPC_DATABSS;
 }
 
 
@@ -723,6 +730,12 @@ static void handle_f96(char *s)
 {
   handle_data(s,OPSZ_FLOAT|96);
 }
+
+
+static void handle_fpd(char *s)
+{
+  handle_data(s,OPSZ_FLOAT|97);  /* packed decimal */
+}
 #endif
 
 
@@ -793,31 +806,31 @@ static void handle_block(char *s,int size)
 
 static void handle_xspc8(char *s)
 {
-  handle_uspace(s,8);
+  handle_dbss(s,8);
 }
 
 
 static void handle_xspc16(char *s)
 {
-  handle_uspace(s,16);
+  handle_dbss(s,16);
 }
 
 
 static void handle_xspc32(char *s)
 {
-  handle_uspace(s,32);
+  handle_dbss(s,32);
 }
 
 
 static void handle_xspc64(char *s)
 {
-  handle_uspace(s,64);
+  handle_dbss(s,64);
 }
 
 
 static void handle_xspc96(char *s)
 {
-  handle_uspace(s,96);
+  handle_dbss(s,96);
 }
 
 
@@ -1113,7 +1126,9 @@ static void handle_incbin(char *s)
 
 static void handle_rept(char *s)
 {
-  new_repeat((utaddr)parse_constexpr(&s),NULL,NULL,rept_dirlist,endr_dirlist);
+  int cnt = (int)parse_constexpr(&s);
+
+  new_repeat(cnt<0?0:cnt,NULL,NULL,rept_dirlist,endr_dirlist);
 }
 
 
@@ -1491,7 +1506,7 @@ static void handle_cargs(char *s)
       s = skip(s+1);
   }
   else
-    offs = number_expr(4);  /* default offset */
+    offs = number_expr(bytespertaddr);  /* default offset */
 
   for (;;) {
 
@@ -1577,6 +1592,43 @@ static void handle_printv(char *s)
       break;
     s = skip(s+1);
   }    
+}
+
+static void handle_echo(char *s)
+{
+  if (phxass_compat) {
+    char *txt = parse_name(&s);
+    if (txt)
+      add_atom(0,new_text_atom(txt));
+  }
+  else {
+    for (;;) {
+      if (*s=='\"' || *s=='\'') {
+        char *txt = parse_name(&s);
+        if (txt)
+          add_atom(0,new_text_atom(txt));
+      }
+      else {
+        add_atom(0,new_expr_atom(parse_expr(&s),PEXP_SDEC,32));
+      }
+      s = skip(s);
+      if (*s != ',')
+        break;
+      s = skip(s+1);
+    }
+  }
+  add_atom(0,new_text_atom(NULL));  /* new line */
+}
+
+static void handle_showoffset(char *s)
+{
+  char *txt;
+
+  if (txt = parse_name(&s))
+    add_atom(0,new_text_atom(txt));
+  add_atom(0,new_text_atom(" "));
+  add_atom(0,new_expr_atom(curpc_expr(),PEXP_HEX,32));
+  add_atom(0,new_text_atom(NULL));  /* new line */
 }
 
 static void handle_dummy_expr(char *s)
@@ -1708,6 +1760,7 @@ struct {
   "dc.s",P|D,handle_f32,
   "dc.d",P|D,handle_f64,
   "dc.x",P|D,handle_f96,
+  "dc.p",P|D,handle_fpd,
 #endif
   "ds",P|D,handle_spc16,
   "ds.b",P|D,handle_spc8,
@@ -1812,9 +1865,9 @@ struct {
   "rs.w",P|D,handle_rs16,
   "rs.l",P|D,handle_rs32,
   "rs.q",P,handle_rs64,
-  "rs.s",P|D,handle_rs32,
-  "rs.d",P|D,handle_rs64,
-  "rs.x",P|D,handle_rs96,
+  "rs.s",P,handle_rs32,
+  "rs.d",P,handle_rs64,
+  "rs.x",P,handle_rs96,
   "so",P,handle_rs16,
   "so.b",P,handle_rs8,
   "so.w",P,handle_rs16,
@@ -1832,9 +1885,10 @@ struct {
   "fo.d",P,handle_fo64,
   "fo.x",P,handle_fo96,
   "cargs",P|D,handle_cargs,
-  "echo",P,handle_printt,
+  "echo",P,handle_echo,
   "printt",0,handle_printt,
   "printv",0,handle_printv,
+  "showoffset",P,handle_showoffset,
   "auto",0,handle_noop,
   "inline",P,handle_inline,
   "einline",P,handle_einline,
@@ -2360,8 +2414,8 @@ int expand_macro(source *src,char **line,char *d,int dlen)
       else
         unique_id = src->id;
 
-      nc = snprintf(d,dlen,"_%06lu",unique_id);
-      if (nc < dlen) {
+      if (dlen > 7) {
+        nc = sprintf(d,"_%06lu",unique_id);
         switch (*s) {
           case '!':
             /* push id onto stack */
@@ -2415,11 +2469,15 @@ int expand_macro(source *src,char **line,char *d,int dlen)
         fmt = "%lu";
       if (name = parse_symbol(&s)) {
         if ((sym = find_symbol(name)) && sym->type==EXPRESSION) {
-          if (eval_expr(sym->expr,&val,NULL,0))
-            nc = sprintf(d,fmt,(unsigned long)(uint32_t)val);
+          if (eval_expr(sym->expr,&val,NULL,0)) {
+            if (dlen > 9)
+              nc = sprintf(d,fmt,(unsigned long)(uint32_t)val);
+            else
+              nc = -1;
+          }
         }
         myfree(name);
-        if (*s++!='>' || nc<0) {
+        if (*s++ != '>') {
           syntax_error(19);  /* invalid numeric expansion */
           return 0;
         }
@@ -2432,20 +2490,28 @@ int expand_macro(source *src,char **line,char *d,int dlen)
 
     else if (*s == '#') {
       /* \# : insert number of parameters */
-      nc = sprintf(d,"%d",src->num_params);
-      s++;
+      if (dlen > 3) {
+        nc = sprintf(d,"%d",src->num_params);
+        s++;
+      }
+      else
+        nc = -1;
     }
 
     else if (*s=='?' && isdigit((unsigned char)*(s+1))) {
       /* \?n : insert parameter n length */
-      nc = sprintf(d,"%d",*(s+1)=='0'?
+      if (dlen > 3) {
+        nc = sprintf(d,"%d",*(s+1)=='0'?
 #if MAX_QUALIFIERS > 0
-                          src->qual_len[0]:
+                            src->qual_len[0]:
 #else
-                          0:
+                            0:
 #endif
-                          src->param_len[*(s+1)-'1']);
-      s += 2;
+                            src->param_len[*(s+1)-'1']);
+        s += 2;
+      }
+      else
+        nc = -1;
     }
 
     else if (*s == '.') {

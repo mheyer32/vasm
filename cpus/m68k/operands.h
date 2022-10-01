@@ -51,7 +51,7 @@ enum {
   REG_RAMBAR,REG_RAMBAR0,REG_RAMBAR1,
   REG_MPCR,REG_EDRAMBAR,REG_SECMBAR,REG_MBAR,
   REG_PCR1U0,REG_PCR1L0,REG_PCR2U0,REG_PCR2L0,REG_PCR3U0,REG_PCR3L0,
-  REG_PCR1U1,REG_PCR1L1,REG_PCR2U1,REG_PCR2L1,REG_PCR3U1,REG_PCR3L1,
+  REG_PCR1U1,REG_PCR1L1,REG_PCR2U1,REG_PCR2L1,REG_PCR3U1,REG_PCR3L1
 };
 
 
@@ -61,14 +61,14 @@ enum {
   ((o)<<14)|((p)<<15))
 
 enum {
-  OP_D8=1,OP_D16,OP_D32,OP_D64,OP_F32,OP_F64,OP_F96,
+  OP_D8=1,OP_D16,OP_D32,OP_D64,OP_F32,OP_F64,OP_F96,OP_FPD,
   D_,A_,B_,AI,IB,R_,RM,DD,CS,VDR2,VDR4,PA,AP,DP,
   F_,FF,FR,FPIAR,IM,QI,IR,BR,AB,VA,M6,RL,FL,FS,
   AY,AM,MA,MI,FA,CF,MAQ,CFAM,CM,AL,DA,DN,CFDA,CT,AC,AD,CFAD,
-  BD,BS,AK,MS,MR,CFMM,CFMN,ND,NI,NJ,NK,BY,BI,BJ,
+  BD,BS,AK,MS,MR,CFMM,CFMN,ND,NI,NJ,NK,BY,BI,BJ,OF_,
   _CCR,_SR,_USP,_CACHES,_ACC,_MACSR,_MASK,_CTRL,_ACCX,_AEXT,
   _VAL,_FC,_RP_030,_RP_851,_TC,_AC,_M1_B,_BAC,_BAD,_PSR,_PCSR,
-  _TT,SH,VX,VXR2,VXR4
+  _TT,SH,VX,VXR2,VXR4,OVX
 };
 
 struct optype optypes[] = {
@@ -93,6 +93,9 @@ struct optype optypes[] = {
   _(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0),OTF_DATA|OTF_FLTIMM,0,0,
 
 /* OP_F96    96-bit data */
+  _(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0),OTF_DATA|OTF_FLTIMM,0,0,
+
+/* OP_FPD    96-bit data (Packed Decimal) */
   _(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0),OTF_DATA|OTF_FLTIMM,0,0,
 
 /* D_        data register */
@@ -273,6 +276,9 @@ struct optype optypes[] = {
 /* BJ        (Apollo) all except Dn/An & immediate, 0-6,7.0-3, An -> Bn */
   _(0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0),FL_BnReg,0,0,
 
+/* OF_       (Apollo) optional FPU register FPn */
+  _(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0),OTF_OPT,0,0,
+
 /* special registers */
 /* _CCR */
   _(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1),OTF_SPECREG|OTF_CHKREG,REG_CCR,REG_CCR,
@@ -329,6 +335,8 @@ struct optype optypes[] = {
   _(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1),OTF_SPECREG|OTF_VXRNG2|OTF_SRRANGE|OTF_CHKREG,REG_VX00,REG_VX23,
 /* VXR4 (Apollo) En-En+3 */
   _(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1),OTF_SPECREG|OTF_VXRNG4|OTF_SRRANGE|OTF_CHKREG,REG_VX00,REG_VX23,
+/* OVX (Apollo) optional En register */
+  _(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1),OTF_OPT|OTF_SPECREG|OTF_SRRANGE|OTF_CHKREG,REG_VX00,REG_VX23,
 };
 
 #undef _
@@ -340,8 +348,8 @@ static void write_val(unsigned char *,int,int,taddr,int);
 
 static void insert_cas2(unsigned char *d,struct oper_insert *i,operand *o)
 {
-  uint16_t w1 = (*(d+2)<<8) | *(d+3);
-  uint16_t w2 = (*(d+4)<<8) | *(d+5);
+  uint16_t w1 = (((uint16_t)*(d+2))<<8) | *(d+3);
+  uint16_t w2 = (((uint16_t)*(d+4))<<8) | *(d+5);
 
   w1 |= (i->size==4 ? o->reg&15 : o->reg&7) << (16-((i->pos-16)+i->size));
   w2 |= (o->reg>>4) << (16-((i->pos-16)+i->size));
@@ -376,8 +384,11 @@ static void insert_muldivl(unsigned char *d,struct oper_insert *i,operand *o)
 
 static void insert_divl(unsigned char *d,struct oper_insert *i,operand *o)
 {
-  *(d+2) |= o->reg & 0xf0;
-  *(d+3) |= o->reg & 0xf;
+  if (o->flags & FL_DoubleReg) {
+    *(d+2) |= o->reg & 0xf0;
+    *(d+3) |= o->reg & 0xf;
+  }
+  else insert_muldivl(d,i,o);
 }
 
 static void insert_tbl(unsigned char *d,struct oper_insert *i,operand *o)
