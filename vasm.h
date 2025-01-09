@@ -1,5 +1,5 @@
 /* vasm.h  main header file for vasm */
-/* (c) in 2002-2023 by Volker Barthelmann */
+/* (c) in 2002-2024 by Volker Barthelmann */
 
 #include <stdlib.h>
 #include <stddef.h>
@@ -9,15 +9,17 @@
 #include <string.h>
 #include <limits.h>
 
-typedef struct symbol symbol;
-typedef struct section section;
+typedef struct atom atom;
 typedef struct dblock dblock;
 typedef struct sblock sblock;
+typedef struct symbol symbol;
+typedef struct section section;
 typedef struct expr expr;
 typedef struct macro macro;
 typedef struct source source;
 typedef struct listing listing;
 typedef struct regsym regsym;
+typedef struct rlist rlist;
 
 typedef struct strbuf {
   size_t size;
@@ -26,7 +28,7 @@ typedef struct strbuf {
 } strbuf;
 #define STRBUFINC 0x100
 
-#define MAXPADBYTES 8  /* max. pattern size to pad alignments */
+#define MAXPADSIZE 8  /* max. pattern size to pad alignments */
 
 #include "cpu.h"
 #include "symbol.h"
@@ -47,6 +49,10 @@ typedef struct strbuf {
 
 #if !defined(BIGENDIAN)&&defined(LITTLEENDIAN)
 #define BIGENDIAN (!LITTLEENDIAN)
+#endif
+
+#if !defined(BITSPERBYTE)
+#define BITSPERBYTE 8
 #endif
 
 #ifndef MNEMONIC_VALID
@@ -104,10 +110,10 @@ struct section {
   atom *first;
   atom *last;
   taddr align;
-  uint8_t pad[MAXPADBYTES];
+  uint8_t pad[MAXPADSIZE];
   int padbytes;
   uint32_t flags;
-  uint32_t memattr;  /* type of memory, used by some object formats */
+  taddr memattr;  /* type of memory, used by some object formats */
   taddr org;
   taddr pc;
   unsigned long idx; /* usable by output module */
@@ -115,7 +121,7 @@ struct section {
 
 /* mnemonic description */
 typedef struct mnemonic {
-  char *name;
+  const char *name;
 #if MAX_OPERANDS!=0
   int operand_type[MAX_OPERANDS];
 #endif
@@ -128,10 +134,10 @@ typedef struct mnemonic {
 #define OPSZ_SWAP	0x200  /* operand stored with swapped bytes */
 
 
-extern char *inname,*outname,*output_format;
+extern char *inname,*outname,*output_format,*defsectname,*defsecttype;
+extern taddr defsectorg,inst_alignment;
 extern int chklabels,nocase,no_symbols,pic_check,unnamed_sections;
 extern unsigned space_init;
-extern taddr inst_alignment;
 extern int asciiout,secname_attr,warn_unalloc_ini_dat;
 extern hashtable *mnemohash;
 extern char *filename,*debug_filename;
@@ -142,21 +148,23 @@ extern struct stabdef *first_nlist,*last_nlist;
 extern char emptystr[];
 extern char vasmsym_name[];
 
+extern int octetsperbyte,output_bitsperbyte,output_bytes_le,input_bytes_le;
 extern unsigned long long taddrmask;
-#define ULLTADDR(x) (((unsigned long long)x)&taddrmask)
 extern taddr taddrmin,taddrmax;
+#define ULLTADDR(x) (((unsigned long long)x)&taddrmask)
+#define ULLTVAL(x) ((unsigned long long)((utaddr)(x)))
 
 /* provided by main assembler module */
 extern int debug;
 
 void leave(void);
-void set_default_output_format(char *);
+void set_taddr(void);
 void set_section(section *);
-section *new_section(char *,char *,int);
+section *new_section(const char *,const char *,int);
 section *new_org(taddr);
-section *find_section(char *,char *);
-void switch_section(char *,char *);
-void switch_offset_section(char *,taddr);
+section *find_section(const char *,const char *);
+void switch_section(const char *,const char *);
+void switch_offset_section(const char *,taddr);
 void add_align(section *,taddr,expr *,int,unsigned char *);
 section *default_section(void);
 void push_section(void);
@@ -169,6 +177,7 @@ int end_rorg(void);
 void try_end_rorg(void);
 void start_rorg(taddr);
 void print_section(FILE *,section *);
+void set_syntax_default(void);
 
 #define setfilename(x) filename=(x)
 #define getfilename() filename
@@ -194,17 +203,24 @@ void disable_warning(int);
 #define ierror(x) general_error(4,(x),__LINE__,__FILE__)
 
 /* provided by cpu.c */
-extern int bitsperbyte,bytespertaddr;
+extern int bytespertaddr;
 extern const int mnemonic_cnt;
 extern mnemonic mnemonics[];
 extern const char *cpu_copyright;
-extern char *cpuname;
+extern const char *cpuname;
 
-int init_cpu();
+/* convert target-bytes into the host's 8-bit bytes */
+#if BITSPERBYTE == 8
+#define OCTETS(n) (n)
+#else
+#define OCTETS(n) ((n)*octetsperbyte)
+#endif
+
+int init_cpu(void);
 int cpu_args(char *);
 char *parse_cpu_special(char *);
-operand *new_operand();
-int parse_operand(char *text,int len,operand *out,int requires);
+operand *new_operand(void);
+int parse_operand(char *,int,operand *,int);
 size_t instruction_size(instruction *,section *,taddr);
 dblock *eval_instruction(instruction *,section *,taddr);
 dblock *eval_data(operand *,size_t,section *,taddr);
@@ -226,11 +242,10 @@ extern const char *syntax_copyright;
 extern char commentchar;
 extern int dotdirs;
 extern hashtable *dirhash;
-extern char *defsectname;
-extern char *defsecttype;
 
-int init_syntax();
+int init_syntax(void);
 int syntax_args(char *);
+int syntax_defsect(void);
 void parse(void);
 char *parse_macro_arg(struct macro *,char *,struct namelen *,struct namelen *);
 int expand_macro(source *,char **,char *,int);
@@ -245,7 +260,8 @@ strbuf *get_local_label(int,char **);
 extern int tos_hisoft_dri;
 #endif
 #ifdef OUTHUNK
-extern int hunk_onlyglobal;
+extern int hunk_xdefonly;
+extern int hunk_devpac;
 #endif
 
 int init_output_test(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
@@ -262,3 +278,6 @@ int init_output_xfile(char **,void (**)(FILE *,section *,symbol *),int (**)(char
 int init_output_cdef(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
 int init_output_ihex(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
 int init_output_o65(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
+int init_output_woz(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
+int init_output_pap(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));
+int init_output_hans(char **,void (**)(FILE *,section *,symbol *),int (**)(char *));

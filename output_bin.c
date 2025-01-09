@@ -1,10 +1,10 @@
-/* output_bin.c binary output driver for vasm */
-/* (c) in 2002-2009,2013-2023 by Volker Barthelmann and Frank Wille */
+/* bin.c binary output driver for vasm */
+/* (c) in 2002-2009,2013-2024 by Volker Barthelmann and Frank Wille */
 
 #include "vasm.h"
 
 #ifdef OUTBIN
-static char *copyright="vasm binary output module 2.2 (c) 2002-2023 Volker Barthelmann and Frank Wille";
+static char *copyright="vasm binary output module 2.3c (c) 2002-2024 Volker Barthelmann and Frank Wille";
 
 enum {
   BINFMT_RAW,           /* no header */
@@ -22,13 +22,14 @@ enum {
 static int binfmt = BINFMT_RAW;
 static char *exec_symname;
 static taddr exec_addr;
+static int addrbits,coalesce;
 
 
 static int orgcmp(const void *sec1,const void *sec2)
 {
-  if (ULLTADDR((*(section **)sec1)->org) > ULLTADDR((*(section **)sec2)->org))
+  if (((utaddr)(*(section **)sec1)->org) > ((utaddr)(*(section **)sec2)->org))
     return 1;
-  if (ULLTADDR((*(section **)sec1)->org) < ULLTADDR((*(section **)sec2)->org))
+  if (((utaddr)(*(section **)sec1)->org) < ((utaddr)(*(section **)sec2)->org))
     return -1;
   return 0;
 }
@@ -36,18 +37,18 @@ static int orgcmp(const void *sec1,const void *sec2)
 
 static void write_output(FILE *f,section *sec,symbol *sym)
 {
-  section *s,*s2,**seclist,**slp;
+  section *s,**seclist,**slp;
   unsigned long long pc=0,npc;
   size_t nsecs;
   long hdroffs;
   char *nptr;
   atom *p;
 
-  if (!sec)
+  if (sec == NULL)
     return;
 
   for (; sym; sym=sym->next) {
-    if (sym->type == IMPORT)
+    if (sym->type==IMPORT)
       output_error(6,sym->name);  /* undefined symbol */
 
     if (exec_symname!=NULL && !strcmp(exec_symname,sym->name)) {
@@ -58,17 +59,8 @@ static void write_output(FILE *f,section *sec,symbol *sym)
   if (exec_symname != NULL)
     output_error(6,exec_symname);  /* start-symbol not found */
 
-  /* we don't support overlapping sections */
-  for (s=sec,nsecs=0; s!=NULL; s=s->next) {
-    for (s2=s->next; s2; s2=s2->next) {
-      if (((ULLTADDR(s2->org) >= ULLTADDR(s->org) &&
-            ULLTADDR(s2->org) < ULLTADDR(s->pc)) ||
-           (ULLTADDR(s2->pc) > ULLTADDR(s->org) &&
-            ULLTADDR(s2->pc) <= ULLTADDR(s->pc))))
-        output_error(0);
-    }
-    nsecs++;
-  }
+  /* we don't support overlapping sections, count sections */
+  nsecs = chk_sec_overlap(sec);
 
   /* make an array of section pointers, sorted by their start address */
   seclist = (section **)mymalloc(nsecs * sizeof(section *));
@@ -124,16 +116,25 @@ static void write_output(FILE *f,section *sec,symbol *sym)
     case BINFMT_FOENIXPGX:
       /* C256 Foenix single-segment header PGX
        * 00:    "PGX"
-       * 03:    $01 for 65816 CPU
+       * 03:    $01 for 65816, $03 for 65C02 CPU
        * 04-07: load/execute address (little endian)
        */
-      fw32(f,0x50475801,1);
-      fw32(f,sec->org,0);
-      break;
+#if defined(VASM_CPU_650X)
+      if (cpu_type & (WDC65816|M65C02)) {
+        uint8_t id[4] = { 'P','G','X' };
+
+        id[3] = (cpu_type & WDC65816) ? 1 : 3;
+        fwdata(f,id,4);
+        fw32(f,sec->org,0);
+        break;
+      }
+#endif
+      cpu_error(1,cpuname);
+      return;
 
     case BINFMT_FOENIXPGZ:
       /* C256 Foenix multi-segment header PGZ: "Z" followed by seg. headers */
-      fw8(f,'Z');
+      fw8(f,addrbits<32 ? 'Z' : 'z');	/* Z: 16/24-bit, z: 32-bit addresses */
       break;
 
     case BINFMT_ORICMC:
@@ -200,26 +201,32 @@ static void write_output(FILE *f,section *sec,symbol *sym)
         break;
 
       case BINFMT_FOENIXPGZ:
-        /* 00-02: load-address of segment (little endian)
-         * 03-05: size of segment (little endian)
+        /* 00-02/00-03: load-address of segment (little endian)
+         * 03-05/04-07: size of segment (little endian)
          */
-        fw24(f,s->org,0);
-        fw24(f,s->pc-s->org,0);
+        if (addrbits < 32) {
+          fw24(f,s->org,0);
+          fw24(f,s->pc-s->org,0);
+        }
+        else {
+          fw32(f,s->org,0);
+          fw32(f,s->pc-s->org,0);
+        }
         break;
 
       default:
         /* fill gap between sections with pad-bytes */
-        if (s!=seclist[0] && ULLTADDR(s->org) > pc)
-          fwalignpattern(f,ULLTADDR(s->org)-pc,s->pad,s->padbytes);
+        if (!coalesce && s!=seclist[0] && ((unsigned long long)s->org) > pc)
+          fwpattern(f,((unsigned long long)s->org)-pc,s->pad,s->padbytes);
         break;
     }
 
     /* write section contents */
-    for (p=s->first,pc=ULLTADDR(s->org); p; p=p->next) {
-      npc = ULLTADDR(fwpcalign(f,p,s,pc));
+    for (p=s->first,pc=(unsigned long long)s->org; p; p=p->next) {
+      npc = fwpcalign(f,p,s,pc);
 
       if (p->type == DATA)
-        fwdata(f,p->content.db->data,p->content.db->size);
+        fwdblock(f,p->content.db);
       else if (p->type == SPACE)
         fwsblock(f,p->content.sb);
 
@@ -252,8 +259,14 @@ static void write_output(FILE *f,section *sec,symbol *sym)
     case BINFMT_FOENIXPGZ:
       /* trailer with execute-address and a zero-size to indicate that
          no more segments follow */
-      fw24(f,exec_addr?exec_addr:sec->org,0);
-      fw24(f,0,0);
+      if (addrbits < 32) {
+        fw24(f,exec_addr?exec_addr:sec->org,0);
+        fw24(f,0,0);
+      }
+      else {
+        fw32(f,exec_addr?exec_addr:sec->org,0);
+        fw32(f,0,0);
+      }
       break;
 
     case BINFMT_ORICMC:
@@ -269,8 +282,19 @@ static void write_output(FILE *f,section *sec,symbol *sym)
 
 static int output_args(char *p)
 {
-  if (!strncmp(p,"-exec=",6)) {
+  long long val;
+
+  if (!strcmp(p,"-coalesced")) {
+    coalesce = 1;
+    return 1;
+  }
+  else if (!strncmp(p,"-exec=",6)) {
     exec_symname = p + 6;
+    return 1;
+  }
+  else if (!strncmp(p,"-start=",7)) {
+    sscanf(p+7,"%lli",&val);
+    defsectorg = val;  /* set start of default section */
     return 1;
   }
   else if (!strcmp(p,"-apple-bin")) {
@@ -318,6 +342,9 @@ int init_output_bin(char **cp,void (**wo)(FILE *,section *,symbol *),int (**oa)(
   *cp = copyright;
   *wo = write_output;
   *oa = output_args;
+  defsecttype = emptystr;  /* default section is "org 0" */
+  output_bitsperbyte = 1;  /* we do support BITSPERBYTE != 8 */
+  addrbits = bytespertaddr * BITSPERBYTE;
   return 1;
 }
 

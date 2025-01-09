@@ -1,4 +1,4 @@
-/* output_gst.c Atari GST output driver for vasm */
+/* gst.c Atari GST output driver for vasm */
 /* (c) in 2023 by Frank Wille */
 
 #include "vasm.h"
@@ -155,15 +155,8 @@ static int offscmp(const void *left,const void *right)
 static int get_sorted_rlist(atom *a)
 {
   static int max_relocs_per_atom = 0;
+  rlist *rl = get_relocs(a);
   int nrel = 0;
-  rlist *rl;
-
-  if (a->type == DATA)
-    rl = a->content.db->relocs;
-  else if (a->type == SPACE)
-    rl = a->content.sb->relocs;
-  else
-    rl = NULL;
 
   while (rl) {
     if (nrel >= max_relocs_per_atom) {
@@ -221,14 +214,14 @@ static void stream_section(FILE *f,section *sec)
 
   for (npc=sec->org,a=sec->first; a; a=a->next) {
     size_t offs = 0;
-    int nrel,i;
+    int nrel,i,t;
 
     pc = fwpcalign(f,a,sec,npc);
     npc = pc + atom_size(a,sec,pc);
     nrel = get_sorted_rlist(a);
 
     for (i=0; i<nrel; i++) {
-      if (sorted_rlist[i]->type <= LAST_STANDARD_RELOC) {
+      if ((t = std_reloc(sorted_rlist[i])) >= 0) {
         nreloc *r = (nreloc *)sorted_rlist[i]->reloc;
         size_t roffs = r->byteoffset;
         uint8_t rule = r->size >> 3;
@@ -248,7 +241,7 @@ static void stream_section(FILE *f,section *sec)
           else
             ierror(0);
 
-          switch (sorted_rlist[i]->type) {
+          switch (t) {
             case REL_ABS:
               rule |= GSTR_UNSIGNED | GSTR_ABS;
               break;
@@ -256,17 +249,17 @@ static void stream_section(FILE *f,section *sec)
               rule |= GSTR_SIGNED | GSTR_PCREL;
               break;
             default:
-              unsupp_reloc_error(sorted_rlist[i]);
+              unsupp_reloc_error(a,sorted_rlist[i]);
               break;
           }
           gst_xref(f,r->addend,rule,refid);
           offs += rule & 7;  /* reloc field size */
         }
         else
-          unsupp_reloc_error(sorted_rlist[i]);
+          unsupp_reloc_error(a,sorted_rlist[i]);
       }
       else
-        unsupp_reloc_error(sorted_rlist[i]);
+        unsupp_reloc_error(a,sorted_rlist[i]);
     }
     stream_data(f,sec,a,offs,(npc-pc)-offs);
   }
@@ -318,10 +311,6 @@ static int output_args(char *p)
 int init_output_gst(char **cp,void (**wo)(FILE *,section *,symbol *),
                     int (**oa)(char *))
 {
-  if (bitsperbyte != 8) {
-    output_error(1, cpuname); /* output module doesn't support (cpuname) */
-    return 0;
-  }
   *cp = copyright;
   *wo = write_output;
   *oa = output_args;
