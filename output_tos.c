@@ -1,29 +1,31 @@
-/* output_tos.c Atari TOS executable output driver for vasm */
-/* (c) in 2009-2016,2020,2021,2023 by Frank Wille */
+/* tos.c Atari TOS executable output driver for vasm */
+/* (c) in 2009-2016,2020-2024 by Frank Wille */
 
 #include "vasm.h"
 #include "output_tos.h"
 #if defined(OUTTOS) && defined(VASM_CPU_M68K)
-static char *copyright="vasm tos output module 2.1a (c) 2009-2016,2020,2021,2023 Frank Wille";
+static char *copyright="vasm tos output module 2.4a (c) 2009-2016,2020-2024 Frank Wille";
 int tos_hisoft_dri = 1;
+int sozobonx_dri;
 
 static int tosflags,textbasedsyms;
 static int max_relocs_per_atom;
+static utaddr zfile_org;
 static section *sections[3];
 static utaddr secsize[3];
 static utaddr secoffs[3];
-static utaddr sdabase,lastoffs;
+static utaddr sdabase;
 static rlist **sorted_rlist;
 
 #define SECT_ALIGN 2  /* TOS sections have to be aligned to 16 bits */
 
 
+
 static int tos_initwrite(section *sec,symbol *sym)
 {
-  int nsyms = 0;
-  int i;
+  int nsyms,i;
 
-  if (!exec_out)
+  if (!exec_out || sozobonx_dri)
     tos_hisoft_dri = 0;  /* 8 character symbols only, in object files */
 
   /* find exactly one text, data and bss section for DRI */
@@ -31,19 +33,22 @@ static int tos_initwrite(section *sec,symbol *sym)
   secsize[S_TEXT] = secsize[S_DATA] = secsize[S_BSS] = 0;
 
   for (; sec; sec=sec->next) {
-    /* section size is assumed to be in in (sec->pc - sec->org), otherwise
-       we would have to calculate it from the atoms and store it there */
-    if ((sec->pc - sec->org) > 0 || (sec->flags & HAS_SYMBOLS)) {
+    if (get_sec_size(sec) > 0 || (sec->flags & HAS_SYMBOLS)) {
       i = get_sec_type(sec);
       if (i<S_TEXT || i>S_BSS) {
         output_error(3,sec->attr);  /* section attributes not supported */
         i = S_TEXT;
       }
       if (!sections[i]) {
-        sections[i] = sec;
-        secsize[i] = (get_sec_size(sec) + SECT_ALIGN - 1) /
-                     SECT_ALIGN * SECT_ALIGN;
+        uint64_t sz = get_sec_size(sec);
+
         sec->idx = i;  /* section index 0:text, 1:data, 2:bss */
+        sections[i] = sec;
+        if (sz+SECT_ALIGN <= 0x100000000ULL)
+          secsize[i] = (sz + SECT_ALIGN - 1) / SECT_ALIGN * SECT_ALIGN;
+        else
+          output_error(23,sec->name,
+                       0x100000000ULL-SECT_ALIGN,(unsigned long long)sz);
       }
       else
         output_error(7,sec->name);
@@ -51,27 +56,32 @@ static int tos_initwrite(section *sec,symbol *sym)
   }
 
   max_relocs_per_atom = 1;
-  secoffs[S_TEXT] = 0;
-  secoffs[S_DATA] = secsize[S_TEXT] + balign(secsize[S_TEXT],SECT_ALIGN);
+  secoffs[S_TEXT] = zfile_org;
+  secoffs[S_DATA] = secoffs[S_TEXT] + secsize[S_TEXT] +
+                    balign(secsize[S_TEXT],SECT_ALIGN);
   secoffs[S_BSS] = secoffs[S_DATA] + secsize[S_DATA] +
-                  balign(secsize[S_DATA],SECT_ALIGN);
+                   balign(secsize[S_DATA],SECT_ALIGN);
   /* define small data base as .data+32768 @@@FIXME! */
   sdabase = secoffs[S_DATA] + 0x8000;
 
   /* count symbols */
+  nsyms = sozobonx_dri ? 1 : 0;  /* first symbol may be "SozobonX" */
   for (; sym; sym=sym->next) {
     /* ignore symbols preceded by a '.' and internal symbols */
     if (*sym->name!='.' && *sym->name!=' ' && !(sym->flags & VASMINTERN)) {
       if (sym->flags & WEAK)
         output_error(10,sym->name);  /* weak symbol treated as global */
 
-      if (!(sym->flags & COMMON) && sym->type==LABSYM) {
+      if (!exec_out || (!(sym->flags & COMMON) &&
+          (sym->type==LABSYM || sym->type==EXPRESSION))) {
         sym->idx = (unsigned long)nsyms++;
-        if ((strlen(sym->name) > DRI_NAMELEN) && tos_hisoft_dri)
-          nsyms++;  /* extra symbol for long name */
+        if (strlen(sym->name) > DRI_NAMELEN) {
+          if (sozobonx_dri)
+            nsyms += (strlen(sym->name) - 1) / DRI_NAMELEN;
+          else if (tos_hisoft_dri)
+            nsyms++;  /* one extra symbol for long name */
+        }
       }
-      else if (!exec_out)
-        sym->idx = (unsigned long)nsyms++;  /* xref and common in objects */
     }
     else {
       if (!strcmp(sym->name," TOSFLAGS")) {
@@ -81,13 +91,12 @@ static int tos_initwrite(section *sec,symbol *sym)
       sym->flags |= VASMINTERN;
     }
   }
-  return (exec_out && no_symbols) ? 0 : nsyms;
+  return ((exec_out && no_symbols) || zfile_org!=0) ? 0 : nsyms;
 }
 
 
-static void tos_header(FILE *f,unsigned long tsize,unsigned long dsize,
-                        unsigned long bsize,unsigned long ssize,
-                        unsigned long flags)
+static void tos_header(FILE *f,uint32_t tsize,uint32_t dsize,uint32_t bsize,
+                       uint32_t ssize,uint32_t extra,int abs)
 {
   PH hdr;
 
@@ -97,15 +106,15 @@ static void tos_header(FILE *f,unsigned long tsize,unsigned long dsize,
   setval(1,hdr.ph_blen,4,bsize);
   setval(1,hdr.ph_slen,4,ssize);
   setval(1,hdr.ph_magic,4,0);
-  setval(1,hdr.ph_flags,4,flags);
-  setval(1,hdr.ph_abs,2,0);
+  setval(1,hdr.ph_flags,4,extra);
+  setval(1,hdr.ph_abs,2,abs?~0:0);
   fwdata(f,&hdr,sizeof(PH));
 }
 
 
 static void checkdefined(rlist *rl,section *sec,taddr pc,atom *a)
 {
-  if (rl->type <= LAST_STANDARD_RELOC) {
+  if (is_std_reloc(rl)) {
     nreloc *r = (nreloc *)rl->reloc;
 
     if (EXTREF(r->sym))
@@ -133,28 +142,21 @@ static void do_relocs(section *asec,taddr pc,atom *a)
 /* Try to resolve all relocations in a DATA or SPACE atom.
    Very simple implementation which can only handle basic 68k relocs. */
 {
+  rlist *rl = get_relocs(a);
   int rcnt = 0;
   section *sec;
-  rlist *rl;
-
-  if (a->type == DATA)
-    rl = a->content.db->relocs;
-  else if (a->type == SPACE)
-    rl = a->content.sb->relocs;
-  else
-    rl = NULL;
 
   while (rl) {
-    switch (rl->type) {
+    switch (std_reloc(rl)) {
       case REL_SD:
         checkdefined(rl,asec,pc,a);
-        patch_nreloc(a,rl,1,
+        patch_nreloc(a,rl,
                      (tos_sym_value(((nreloc *)rl->reloc)->sym,1)
                       + nreloc_real_addend(rl->reloc)) - sdabase,1);
         break;
       case REL_PC:
         checkdefined(rl,asec,pc,a);
-        patch_nreloc(a,rl,1,
+        patch_nreloc(a,rl,
                      (tos_sym_value(((nreloc *)rl->reloc)->sym,1)
                      + nreloc_real_addend(rl->reloc)) -
                      (pc + ((nreloc *)rl->reloc)->byteoffset),1);
@@ -162,14 +164,14 @@ static void do_relocs(section *asec,taddr pc,atom *a)
       case REL_ABS:
         checkdefined(rl,asec,pc,a);
         sec = ((nreloc *)rl->reloc)->sym->sec;
-        if (!patch_nreloc(a,rl,0,
+        if (!patch_nreloc(a,rl,
                           secoffs[sec?sec->idx:0] +
                           ((nreloc *)rl->reloc)->addend,1))
           break;  /* field overflow */
         if (((nreloc *)rl->reloc)->size == 32)
           break;  /* only support 32-bit absolute */
       default:
-        unsupp_reloc_error(rl);
+        unsupp_reloc_error(a,rl);
         break;
     }
     rcnt++;
@@ -205,10 +207,12 @@ static void tos_writesection(FILE *f,section *sec,taddr sec_align)
 }
 
 
-static void write_dri_sym(FILE *f,char *name,int type,taddr value)
+static void write_dri_sym(FILE *f,const char *name,int type,taddr value)
 {
   struct DRIsym stab;
-  int longname = (strlen(name) > DRI_NAMELEN) && tos_hisoft_dri;
+  int namelen = strlen(name);
+  int longname = (namelen > DRI_NAMELEN) && tos_hisoft_dri;
+  int szb_extensions = sozobonx_dri ? (namelen-1) / DRI_NAMELEN : 0;
 
   strncpy(stab.name,name,DRI_NAMELEN);
   setval(1,stab.type,sizeof(stab.type),longname?(type|STYP_LONGNAME):type);
@@ -222,6 +226,17 @@ static void write_dri_sym(FILE *f,char *name,int type,taddr value)
     strncpy(rest_of_name,name+DRI_NAMELEN,sizeof(struct DRIsym));
     fwdata(f,rest_of_name,sizeof(struct DRIsym));
   }
+  else {
+    int i = DRI_NAMELEN;
+
+    while (szb_extensions--) {
+      strncpy(stab.name,name+i,DRI_NAMELEN);
+      setval(1,stab.type,sizeof(stab.type),STYP_XFLAGS);
+      setval(1,stab.value,sizeof(stab.value),XVALUE);
+      fwdata(f,&stab,sizeof(struct DRIsym));
+      i += DRI_NAMELEN;
+    }
+  }
 }
 
 
@@ -233,10 +248,12 @@ static void tos_symboltable(FILE *f,symbol *sym)
   int t;
 
   for (; sym; sym=sym->next) {
-    /* The TOS symbol table in executables contains all labels,
-       no matter if global or local. But no equates or other types. */
-    if (!(sym->flags & (VASMINTERN|COMMON)) && sym->type == LABSYM) {
-      t = labtype[sym->sec->idx] | STYP_DEFINED;
+    /* The TOS symbol table in executables contains all labels and
+       equates, no matter if global or local. */
+    if (!(sym->flags & (VASMINTERN|COMMON)) &&
+        (sym->type==LABSYM || sym->type==EXPRESSION)) {
+      t = (sym->type==LABSYM ? labtype[sym->sec->idx] : STYP_EQUATED) |
+          STYP_DEFINED;
       if (sym->flags & EXPORT)
         t |= STYP_GLOBAL;
       write_dri_sym(f,sym->name,t,tos_sym_value(sym,textbasedsyms));
@@ -288,15 +305,8 @@ static int offscmp(const void *left,const void *right)
 
 static int get_sorted_rlist(atom *a)
 {
+  rlist *rl = get_relocs(a);
   int nrel = 0;
-  rlist *rl;
-
-  if (a->type == DATA)
-    rl = a->content.db->relocs;
-  else if (a->type == SPACE)
-    rl = a->content.sb->relocs;
-  else
-    rl = NULL;
 
   while (rl) {
     if (nrel >= max_relocs_per_atom) {
@@ -316,6 +326,7 @@ static int get_sorted_rlist(atom *a)
 
 static int tos_writerelocs(FILE *f,section *sec)
 {
+  static utaddr lastoffs = ~0;
   int n = 0;
 
   if (sec) {
@@ -334,12 +345,11 @@ static int tos_writerelocs(FILE *f,section *sec)
         /* write differences between reloc offsets */
         for (i=0; i<nrel; i++) {
           /* make sure to process 32-bit absolute relocations only! */
-          if (sorted_rlist[i]->type==REL_ABS
+          if (std_reloc(sorted_rlist[i])==REL_ABS
               && ((nreloc *)sorted_rlist[i]->reloc)->size==32) {
             newoffs = pc + ((nreloc *)sorted_rlist[i]->reloc)->byteoffset;
-            n++;
 
-            if (lastoffs) {
+            if (lastoffs != ~0) {
               /* determine 8bit difference to next relocation */
               taddr diff = newoffs - lastoffs;
 
@@ -351,9 +361,11 @@ static int tos_writerelocs(FILE *f,section *sec)
               }
               fw8(f,(uint8_t)diff);
             }
-            else  /* first entry is a 32 bits offset */
+            else  /* initial entry is a 32-bit offset */
               fw32(f,newoffs,1);
+
             lastoffs = newoffs;
+            n++;
           }
         }
       }
@@ -380,14 +392,14 @@ static void dri_writerelocs(FILE *f,section *sec,taddr sec_align)
        into the symbol table. */
     for (npc=0,a=sec->first; a; a=a->next) {
       size_t offs = 0;
-      int nrel,i;
+      int nrel,i,rtype;
 
       pc = fwpcalign(f,a,sec,npc);
       npc = pc + atom_size(a,sec,pc);
       nrel = get_sorted_rlist(a);
 
       for (i=0; i<nrel; i++) {
-        if (sorted_rlist[i]->type <= LAST_STANDARD_RELOC) {
+        if ((rtype = std_reloc(sorted_rlist[i])) >= 0) {
           nreloc *r = (nreloc *)sorted_rlist[i]->reloc;
           size_t roffs = r->byteoffset;
           symbol *sym = r->sym;
@@ -396,7 +408,7 @@ static void dri_writerelocs(FILE *f,section *sec,taddr sec_align)
           fwspace(f,roffs-offs);
           offs = roffs;
 
-          switch (sorted_rlist[i]->type) {
+          switch (rtype) {
             case REL_ABS:
               if (r->size==16 || r->size==32) {    /* @@@ restrict to 32? */
                 if (sym->type==LABSYM && sym->sec)
@@ -433,14 +445,14 @@ static void dri_writerelocs(FILE *f,section *sec,taddr sec_align)
             offs += 2;
           }
           else
-            unsupp_reloc_error(sorted_rlist[i]);
+            unsupp_reloc_error(a,sorted_rlist[i]);
         }
         else
-          unsupp_reloc_error(sorted_rlist[i]);
+          unsupp_reloc_error(a,sorted_rlist[i]);
       }
       fwspace(f,(size_t)(npc-pc)-offs);
     }
-    fwalign(f,pc,sec_align);
+    fwalign(f,npc,sec_align);
   }
 }
 
@@ -448,15 +460,21 @@ static void dri_writerelocs(FILE *f,section *sec,taddr sec_align)
 static void write_output(FILE *f,section *sec,symbol *sym)
 {
   int nsyms = tos_initwrite(sec,sym);
-  int nrelocs = 0;
+
+  if (sozobonx_dri!=0 && nsyms==1)
+    nsyms = 0;
 
   tos_header(f,secsize[S_TEXT],secsize[S_DATA],secsize[S_BSS],
-             nsyms*sizeof(struct DRIsym),exec_out?tosflags:0);
+             nsyms*sizeof(struct DRIsym),
+             zfile_org!=0?zfile_org:(exec_out?tosflags:0),
+             zfile_org!=0);
 
   tos_writesection(f,sections[S_TEXT],SECT_ALIGN);
   tos_writesection(f,sections[S_DATA],SECT_ALIGN);
 
   if (nsyms) {
+    if (sozobonx_dri)
+      write_dri_sym(f,XNAME,STYP_XFLAGS,XVALUE);
     if (exec_out)
       tos_symboltable(f,sym);
     else
@@ -466,12 +484,14 @@ static void write_output(FILE *f,section *sec,symbol *sym)
   sorted_rlist = mymalloc(max_relocs_per_atom*sizeof(rlist **));
 
   if (exec_out) {
-    nrelocs += tos_writerelocs(f,sections[S_TEXT]);
-    nrelocs += tos_writerelocs(f,sections[S_DATA]);
-    if (nrelocs)
-      fw8(f,0);
-    else
-      fw32(f,0,1);
+    if (!zfile_org) {
+      int nrelocs = tos_writerelocs(f,sections[S_TEXT]);
+      nrelocs += tos_writerelocs(f,sections[S_DATA]);
+      if (nrelocs)
+        fw8(f,0);
+      else
+        fw32(f,0,1);
+    }
   }
   else {
     dri_writerelocs(f,sections[S_TEXT],SECT_ALIGN);
@@ -495,6 +515,18 @@ static int output_args(char *p)
   else if (!strcmp(p,"-stdsymbols")) {
     tos_hisoft_dri = 0;
     return 1;
+  }
+  else if (!strcmp(p,"-szbx")) {
+    sozobonx_dri = 1;
+    return 1;
+  }
+  else if (exec_out && !strncmp(p,"-zfile=",7)) {
+    long val;
+
+    if (sscanf(p+7,"%li",&val) == 1) {
+      zfile_org = val;
+      return 1;
+    }
   }
   return 0;
 }
